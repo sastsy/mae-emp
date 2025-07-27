@@ -1,0 +1,30 @@
+# Data generation
+data_generation:
+  num_samples: 20000
+  dim: 20
+  rhos_start: -0.9
+  rhos_end: 0.9
+  rhos_num: 11
+  mean: 0
+  std: 1
+
+# MINE 
+model:
+  hidden_dim: 128
+
+# Training
+training:
+  n_epochs: 600
+  batch_size: 512
+  learning_rate: 0.00001
+  ema_decay: 0.01
+  biased_loss: False # set True for original (biased) MINE loss
+  logging_steps: 20
+
+# Evaluation
+evaluation:
+  plot_results: True # whether to generate and show the plot
+
+# General
+device: "cuda" # "cuda" or "cpu"
+seed: 8888
