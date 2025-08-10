@@ -8,7 +8,6 @@ from typing import List, Dict, Any
 import numpy as np
 import torch
 from torch import optim
-import matplotlib.pyplot as plt
 
 from utils import (
     load_config,
@@ -30,6 +29,19 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     logging.info(f"Random seed set to {seed}")
+
+
+class CorrectedLogMeanExp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, T_marginal, ema_val):
+        ctx.save_for_backward(T_marginal, ema_val)
+        return torch.log(ema_val + 1e-8)  # + eps для стабильности
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        T, ema_val = ctx.saved_tensors
+        grad_T = grad_output * torch.exp(T) / (ema_val.detach() + 1e-8)
+        return grad_T, None
 
 
 def compute_unbiased_mine_loss(
@@ -66,6 +78,7 @@ def compute_unbiased_mine_loss(
 
     return loss
 
+
 def compute_biased_mine_loss(
     model: MINE,
     x: torch.Tensor,
@@ -79,21 +92,47 @@ def compute_biased_mine_loss(
     log_denom_biased = torch.logsumexp(marginal_outputs, dim=0) - torch.log(
         torch.tensor(marginal_outputs.size(0), device=device, dtype=torch.float32)
     )
-    mi_lower_bound = joint_outputs.mean() - log_denom_biased
-    loss = -mi_lower_bound
+    loss = -(joint_outputs.mean() - log_denom_biased)
 
     return loss
+
 
 def estimate_mi_unbiased(model: MINE, x: torch.Tensor, y: torch.Tensor, ema: EMA) -> float:
     model.eval()
     with torch.no_grad():
-        E_T = torch.mean(model(x, y))
-        ema_value = torch.tensor(ema.value, device=x.device, dtype=torch.float32)
+        joint_output = model(x, y)
+        ema_value = ema.value.clone().detach()
         log_Z_ema = torch.log(ema_value)
-        mi_estimate = E_T - log_Z_ema
+        mi_estimate = joint_output.mean() - log_Z_ema
     model.train()
 
     return mi_estimate.item()
+
+
+def estimate_mi_biased(
+    model: MINE,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    y_marginal: torch.Tensor,
+    clamp_max: float = 60.0,
+) -> float:
+    model.eval()
+    with torch.no_grad():
+        joint_output = model(x, y)
+        marginal_output = model(x, y_marginal)
+
+        joint_output = torch.clamp(joint_output, max=clamp_max)
+        marginal_output = torch.clamp(marginal_output, max=clamp_max)
+
+        log_mean_exp = torch.logsumexp(marginal_output, dim=0) - torch.log(
+            torch.tensor(marginal_output.size(0), dtype=torch.float32, device=marginal_output.device)
+        )
+
+        mi_estimate = joint_output.mean() - log_mean_exp
+
+    model.train()
+    return mi_estimate.item()
+
 
 def train_MINE(
     model: MINE,
@@ -135,14 +174,19 @@ def train_MINE(
                 loss = compute_biased_mine_loss(model, X_batch, Y_batch, Y_marginal_batch, device)
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         if epoch % logging_steps == 0 or epoch == n_epochs - 1:
-            mi_estimate = estimate_mi_unbiased(model, X_data, Y_data, ema)
+            if not biased_loss:
+                mi_estimate = estimate_mi_unbiased(model, X_data, Y_data, ema)
+            else:
+                mi_estimate = estimate_mi_biased(model, X_data, Y_data, Y_marginal_shuffled)
             logging.info(f"Epoch {epoch}/{n_epochs}, MI (unbiased estimate): {mi_estimate:.4f}")
             mi_estimates_history.append({'epoch': epoch, 'mi_estimate': mi_estimate})
 
     return ema, mi_estimates_history
+
 
 def train_MINE_for_rhos(
     rhos: List[float],
@@ -184,7 +228,10 @@ def train_MINE_for_rhos(
             logging_steps=logging_steps,
         )
 
-        mi_estimate = estimate_mi_unbiased(model, X, Y, final_ema)
+        if not biased_loss:
+            mi_estimate = estimate_mi_unbiased(model, X, Y, final_ema)
+        else:
+            mi_estimate = estimate_mi_biased(model, X, Y, Y[torch.randperm(X.shape[0], device=device)])
         true_mi = true_mutual_information(rho, dim)
 
         results.append({
@@ -195,6 +242,7 @@ def train_MINE_for_rhos(
         })
 
     return results
+
 
 @click.command()
 @click.option("--config_path", default="MINE/train_config.yaml")
