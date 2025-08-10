@@ -44,10 +44,25 @@ def compute_unbiased_mine_loss(
     E_joint = torch.mean(joint_output)
 
     marginal_output = model(x, y_marginal)
-    E_exp_marginal = torch.mean(torch.exp(marginal_output))
-    ema_val = ema.update(E_exp_marginal).detach()
+    
+    # --- Loss with logsumexp ---
+    # log_mean_exp = torch.logsumexp(marginal_output, dim=0) - torch.log(torch.tensor(marginal_output.shape[0], device=marginal_output.device))
+    # ema_val = ema.update(torch.exp(log_mean_exp)).detach()
+    
+    # loss = -(E_joint - torch.exp(log_mean_exp) / ema_val)
+    
+    # --- Autograd loss ---
+    exp_T = torch.exp(marginal_output.detach()).mean()
+    ema_val = ema.update(exp_T).detach()
+    log_marg = CorrectedLogMeanExp.apply(marginal_output, ema_val)
 
-    loss = -(E_joint - E_exp_marginal / ema_val)
+    loss = - (E_joint - log_marg)
+    
+    # --- Ordinary loss ---
+    # E_exp_marginal = torch.mean(torch.exp(marginal_output))
+    # ema_val = ema.update(E_exp_marginal).detach()
+
+    # loss = -(E_joint - E_exp_marginal / ema_val)
 
     return loss
 
