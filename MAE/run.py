@@ -24,30 +24,16 @@
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
-from typing import Optional, Any, Union
 from enum import Enum
 
 import torch
-import torch.nn as nn
-import numpy as np
-from transformers.modeling_outputs import SequenceClassifierOutput
-try:
-    import evaluate
-    _acc = evaluate.load("accuracy")
-except Exception:
-    _acc = None
-
-import torch
 from datasets import load_dataset
-from torchvision.transforms import Compose, Lambda, Normalize, RandomHorizontalFlip, RandomResizedCrop, ToTensor, Resize
+from torchvision.transforms import Compose, Lambda, Normalize, RandomHorizontalFlip, RandomResizedCrop, ToTensor
 from torchvision.transforms.functional import InterpolationMode
 
 import transformers
 from transformers import (
     HfArgumentParser,
-    Trainer,
-    TrainingArguments,
     ViTImageProcessor,
     ViTMAEConfig,
     ViTMAEForPreTraining,
@@ -56,12 +42,11 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from transformers.models.vit_mae.modeling_vit_mae import (
-    ViTMAEForPreTraining,
-    ViTMAEForPreTrainingOutput
-)
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-from transformers import Trainer
+from transformers.models.vit_mae.modeling_vit_mae import ViTMAEForPreTraining
+
+from arguments import DataTrainingArguments, ModelArguments, CustomTrainingArguments
+from custom_trainer import ViTMAETrainer
+from vit_mae_with_bt_modeling import ViTMAEForPreTrainingWithBT
 
 
 """ Pre-training a 🤗 ViT model as an MAE (masked autoencoder), as proposed in https://huggingface.co/papers/2111.06377."""
@@ -88,382 +73,9 @@ def is_valid_bt_variant(variant_str: str) -> bool:
     return variant_str in [v.value for v in BarlowTwinsVariant]
 
 
-@dataclass
-class ViTMAEForPreTrainingOutputBT(ViTMAEForPreTrainingOutput):
-    
-    mae_loss: Optional[torch.FloatTensor] = None
-    bt_loss: Optional[torch.FloatTensor] = None
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    Using `HfArgumentParser` we can turn this class
-    into argparse arguments to be able to specify them on
-    the command line.
-    """
-
-    dataset_name: Optional[str] = field(
-        default="cifar10", metadata={"help": "Name of a dataset from the datasets package"}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    trust_remote_code: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to trust the execution of code from datasets/models defined on the Hub."
-                " This option should only be set to `True` for repositories you trust and in which you have read the"
-                " code, as it will execute code present on the Hub on your local machine."
-            )
-        },
-    )
-    image_column_name: Optional[str] = field(
-        default=None, metadata={"help": "The column name of the images in the files."}
-    )
-    train_dir: Optional[str] = field(default=None, metadata={"help": "A folder containing the training data."})
-    validation_dir: Optional[str] = field(default=None, metadata={"help": "A folder containing the validation data."})
-    train_val_split: Optional[float] = field(
-        default=0.15, metadata={"help": "Percent to split off of train for validation."}
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-                "value if set."
-            )
-        },
-    )
-
-    def __post_init__(self):
-        data_files = {}
-        if self.train_dir is not None:
-            data_files["train"] = self.train_dir
-        if self.validation_dir is not None:
-            data_files["val"] = self.validation_dir
-        self.data_files = data_files if data_files else None
-
-
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/image processor we are going to pre-train.
-    """
-
-    model_name_or_path: str = field(
-        default=None,
-        metadata={
-            "help": (
-                "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
-            )
-        },
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name_or_path"}
-    )
-    config_overrides: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Override some existing default config settings when a model is trained from scratch. Example: "
-                "n_embd=10,resid_pdrop=0.2,scale_attn_weights=false,summary_type=cls_index"
-            )
-        },
-    )
-    cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    image_processor_name: str = field(default=None, metadata={"help": "Name or path of preprocessor config."})
-    token: str = field(
-        default=None,
-        metadata={
-            "help": (
-                "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
-                "generated when running `hf auth login` (stored in `~/.huggingface`)."
-            )
-        },
-    )
-    mask_ratio: float = field(
-        default=0.75, metadata={"help": "The ratio of the number of masked tokens in the input sequence."}
-    )
-    norm_pix_loss: bool = field(
-        default=True, metadata={"help": "Whether or not to train with normalized pixel values as target."}
-    )
-    bt_variant: str = field(
-        default="per_image",
-        metadata={"help": "Choose Barlow Twins variant: 'per_batch' or 'per_image'."}
-    )
-
-
-@dataclass
-class CustomTrainingArguments(TrainingArguments):
-    base_learning_rate: float = field(
-        default=1e-3, metadata={"help": "Base learning rate: absolute_lr = base_lr * total_batch_size / 256."}
-    )
-    # Barlow Twins hyperparameters
-    bt_weight: float = field(default=1.0, metadata={"help": "Weight for Barlow Twins loss when added to MAE loss."})
-    bt_lambda: float = field(default=5e-3, metadata={"help": "Off-diagonal penalty (lambda) in Barlow Twins loss."})
-    bt_eps: float = field(default=1e-9, metadata={"help": "Small eps for std normalization in BT computation."})
-    dataloader_num_workers: int = field(
-        default=8,
-        metadata={"help": "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."}
-    )
-    dataloader_persistent_workers: bool = field(
-        default=False,
-        metadata={"help": "Whether to keep dataloader workers alive between epochs."}
-    )
-    report_to: list[str] = field(
-        default_factory=lambda: ["tensorboard"],
-        metadata={"help": "The list of integrations to report the results and checkpoints to."}
-    )
-
-
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     return {"pixel_values": pixel_values}
-
-
-def collate_fn_cls(examples):
-    pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
-    labels = torch.tensor([ex["label"] for ex in examples])
-    return {"pixel_values": pixel_values, "labels": labels}
-
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    if _acc is not None:
-        return _acc.compute(predictions=preds, references=labels)
-    # fallback w/o evaluate
-    return {"accuracy": (preds == labels).mean().item()}
-
-
-class ViTMAETrainer(Trainer):
-    def compute_loss(
-        self,
-        model: nn.Module,
-        inputs: dict[str, Union[torch.Tensor, Any]],
-        return_outputs: bool = False,
-        num_items_in_batch: Optional[torch.Tensor] = None,
-    ):
-        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        if self.model_accepts_loss_kwargs:
-            kwargs = {}
-            if num_items_in_batch is not None:
-                kwargs["num_items_in_batch"] = num_items_in_batch
-            inputs = {**inputs, **kwargs}
-        outputs = model(**inputs)
-        # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
-        if self.args.past_index >= 0:
-            self._past = outputs[self.args.past_index]
-
-        if labels is not None:
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            model_name = unwrapped_model._get_name()
-            # User-defined compute_loss function
-            if self.compute_loss_func is not None:
-                loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
-            elif model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                loss = self.label_smoother(outputs, labels, shift_labels=True)
-            else:
-                loss = self.label_smoother(outputs, labels)
-        else:
-            if isinstance(outputs, dict) and "loss" not in outputs:
-                raise ValueError(
-                    "The model did not return a loss from the inputs, only the following keys: "
-                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                )
-            # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        
-        # --- Logging our custom bt and mae losses ---
-        mae_loss = getattr(outputs, "mae_loss", None)
-        bt_loss = getattr(outputs, "bt_loss", None)
-        
-        if self.args.logging_dir and self.state.global_step % self.args.logging_steps == 0:
-            logs = {"train/total_loss": loss.item()}
-            if mae_loss is not None:
-                logs["train/mae_loss"] = mae_loss.item()
-            if bt_loss is not None:
-                logs["train/bt_loss"] = bt_loss.item()
-                
-            self.log(logs)
-        # --- (end) Logging our custom bt and mae losses ---
-        
-        if (
-            self.args.average_tokens_across_devices
-            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
-            and num_items_in_batch is not None
-        ):
-            loss *= self.accelerator.num_processes
-
-        return (loss, outputs) if return_outputs else loss
-
-
-# --- Per-Batch ---
-class ViTMAEForPreTrainingWithBT_PerBatch(ViTMAEForPreTraining):
-    def __init__(self, config):
-        super().__init__(config)
-        self.bt_lambda = config.bt_lambda
-        self.bt_loss_weight = config.bt_weight
-        self.bt_eps = config.bt_eps
-
-    def barlow_twins_loss(self, z1, z2):
-        z1_norm = (z1 - z1.mean(0)) / (z1.std(0) + self.bt_eps)
-        z2_norm = (z2 - z2.mean(0)) / (z2.std(0) + self.bt_eps)
-
-        c = torch.mm(z1_norm.T, z2_norm) / z1_norm.shape[0]
-
-        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-        off_diag = (c - torch.eye(c.size(0), device=c.device)).pow_(2).sum()
-        return on_diag + self.bt_lambda * off_diag
-
-    def forward(
-        self,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        **kwargs
-    ) -> Union[tuple, ViTMAEForPreTrainingOutput]:
-
-        outputs = super().forward(pixel_values=pixel_values, **kwargs)
-
-        logits = outputs.logits # (B, num_patches, patch_size**2 * C)
-        mask = outputs.mask # (B, N_patches)
-
-        pred_pixels = logits
-        target_pixels = self.patchify(pixel_values)
-
-        visible_mask = (1 - mask).bool()
-        real_visible = target_pixels[visible_mask]
-        pred_visible = pred_pixels[visible_mask]
-
-        mae_loss = outputs.loss
-        bt_loss = self.barlow_twins_loss(
-            real_visible.view(real_visible.size(0), -1),
-            pred_visible.view(pred_visible.size(0), -1)
-        )
-
-        total_loss = mae_loss + self.bt_loss_weight * bt_loss
-        return ViTMAEForPreTrainingOutputBT(
-            loss=total_loss,
-            logits=outputs.logits,
-            mask=outputs.mask,
-            ids_restore=outputs.ids_restore,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            mae_loss=mae_loss,
-            bt_loss=bt_loss,
-        )
-
-
-# --- Per-Image ---
-class ViTMAEForPreTrainingWithBT_PerImage(ViTMAEForPreTraining):
-    def __init__(self, config):
-        super().__init__(config)
-        self.bt_lambda = config.get("bt_lambda")
-        self.bt_loss_weight = config.get("bt_weight")
-        self.bt_eps = config.get("bt_eps")
-
-    def barlow_twins_loss(self, z1, z2):
-        if z1.numel() == 0 or z2.numel() == 0:
-            return torch.tensor(0.0, device=z1.device)
-
-        if z1.shape[0] < 2:
-            return torch.tensor(0.0, device=z1.device)
-
-        z1_norm = (z1 - z1.mean(0)) / (z1.std(0) + 1e-9)
-        z2_norm = (z2 - z2.mean(0)) / (z2.std(0) + 1e-9)
-
-        c = torch.mm(z1_norm.T, z2_norm) / z1_norm.shape[0]  # (D, D)
-
-        on_diag = torch.diagonal(c).add_(-1).pow(2).sum()
-
-        off = c.clone()
-        off.fill_diagonal_(0.0)
-        off_diag = off.pow(2).sum()
-
-        return on_diag + self.bt_lambda * off_diag
-
-    def forward(
-        self,
-        pixel_values=None,
-        noise=None,
-        head_mask=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        interpolate_pos_encoding=False,
-    ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.vit(
-            pixel_values,
-            noise=noise,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=True,
-            return_dict=True,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-        )
-
-        latent = outputs.last_hidden_state
-        ids_restore = outputs.ids_restore
-        mask = outputs.mask
-
-        decoder_outputs = self.decoder(latent, ids_restore, interpolate_pos_encoding=interpolate_pos_encoding)
-        logits = decoder_outputs.logits
-
-        mae_loss = self.forward_loss(pixel_values, logits, mask, interpolate_pos_encoding=interpolate_pos_encoding)
-
-        bt_loss = 0.0
-        target_pixels = self.patchify(pixel_values, interpolate_pos_encoding)
-        pred_pixels = logits
-
-        B = target_pixels.size(0)
-        bt_loss_accum = 0.0
-        for b in range(B):
-            visible_mask = (mask[b] == 0)
-            if visible_mask.sum() == 0:
-                continue
-            real_b = target_pixels[b][visible_mask]
-            pred_b = pred_pixels[b][visible_mask]
-            bt_loss_accum += self.barlow_twins_loss(real_b, pred_b)
-
-        bt_loss = bt_loss_accum / B
-        total_loss = mae_loss + self.bt_loss_weight * bt_loss
-
-        if not return_dict:
-            return (total_loss, logits, mask, ids_restore)
-
-        return ViTMAEForPreTrainingOutputBT(
-            loss=total_loss,
-            logits=logits,
-            mask=mask,
-            ids_restore=ids_restore,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            mae_loss=mae_loss,
-            bt_loss=bt_loss,
-        )
 
 
 def main():
@@ -574,6 +186,7 @@ def main():
                 "bt_weight": training_args.bt_weight,
                 "bt_lambda": training_args.bt_lambda,
                 "bt_eps": training_args.bt_eps,
+                "bt_variant": model_args.bt_variant,
             }
         )
 
@@ -586,13 +199,12 @@ def main():
         image_processor = ViTImageProcessor()
     
     # if we want to train with barlow-twins variants
-    if BarlowTwinsVariant(model_args.bt_variant) is BarlowTwinsVariant.PER_BATCH:
-        ModelCls = ViTMAEForPreTrainingWithBT_PerBatch 
-    elif BarlowTwinsVariant(model_args.bt_variant) is BarlowTwinsVariant.PER_IMAGE:
-        ModelCls = ViTMAEForPreTrainingWithBT_PerImage 
+    if BarlowTwinsVariant(model_args.bt_variant) in [BarlowTwinsVariant.PER_BATCH, BarlowTwinsVariant.PER_IMAGE]:
+        ModelCls = ViTMAEForPreTrainingWithBT
     else:
         print(f"Unknown bt_variant: {model_args.bt_variant}, falling back to ViTMAEForPreTraining")
         ModelCls = ViTMAEForPreTraining
+    logger.info(f"Training with model type: {ModelCls.__name__}")
 
     # create model
     if model_args.model_name_or_path:

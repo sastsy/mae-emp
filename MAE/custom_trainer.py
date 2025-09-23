@@ -26,8 +26,15 @@ class LinearProbe:
 
     def fit(self, features, labels):
         self.linear.train()
-        dataset = torch.utils.data.TensorDataset(features, labels)
-        loader = DataLoader(dataset, batch_size=64, shuffle=True)
+        dataset = torch.utils.data.TensorDataset(features.cpu(), labels.cpu())
+        loader = DataLoader(
+            dataset,
+            batch_size=64,
+            num_workers=8,
+            pin_memory=True,
+            shuffle=True,
+            persistent_workers=True,
+        )
 
         for _ in range(self.epochs):
             for x, y in loader:

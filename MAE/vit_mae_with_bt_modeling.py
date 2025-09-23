@@ -100,13 +100,13 @@ class ViTMAEForPreTrainingWithBT(ViTMAEForPreTraining):
         logits = decoder_outputs.logits
 
         loss = self.forward_loss(pixel_values, logits, mask, interpolate_pos_encoding=interpolate_pos_encoding)
-        if bt_loss == "per_image":
+        if self.bt_variant == "per_image":
             bt_loss = self.compute_bt_loss_per_image(latent)
-        elif bt_loss == "per_batch":
+        elif self.bt_variant == "per_batch":
             bt_loss = self.compute_bt_loss_per_batch(latent)
         else:
             raise NotImplementedError()
-        total_loss = loss + bt_loss
+        total_loss = loss + 0.005 * bt_loss
 
         return ViTMAEForPreTrainingOutputBT(
             loss=total_loss,
