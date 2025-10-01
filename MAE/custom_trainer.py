@@ -164,14 +164,15 @@ class ViTMAETrainer(Trainer):
         bt_loss = getattr(outputs, "bt_loss", None)
         
         if self.args.logging_dir and self.state.global_step % self.args.logging_steps == 0:
-            logs = {}
-            if mae_loss is not None:
-                logs["mae_loss"] = mae_loss.item()
-            if bt_loss is not None:
-                logs["bt_loss"] = bt_loss.item()
-                
-            self.log(logs)
+            if mae_loss is not None and bt_loss is not None:
+                self.log({
+                    "mae_loss": mae_loss.item(),
+                    "bt_loss": bt_loss.item(),
+                })
         # --- (end) Logging our custom bt and mae losses ---
+        
+        if not model.training and mae_loss is not None:
+            loss = mae_loss
         
         if (
             self.args.average_tokens_across_devices

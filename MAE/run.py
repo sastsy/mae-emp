@@ -47,6 +47,7 @@ from transformers.models.vit_mae.modeling_vit_mae import ViTMAEForPreTraining
 from arguments import DataTrainingArguments, ModelArguments, CustomTrainingArguments
 from custom_trainer import ViTMAETrainer
 from vit_mae_with_bt_modeling import ViTMAEForPreTrainingWithBT
+from custom_callbacks import ClearMLCallback
 
 
 """ Pre-training a 🤗 ViT model as an MAE (masked autoencoder), as proposed in https://huggingface.co/papers/2111.06377."""
@@ -290,6 +291,11 @@ def main():
         processing_class=image_processor,
         data_collator=collate_fn,
     )
+    
+    trainer.add_callback(ClearMLCallback(
+        project_name="MAE Experiments",
+        task_name=f"{training_args.output_dir.split('/')[-1]}",
+    ))
 
     # Training
     if training_args.do_train:
