@@ -1,4 +1,4 @@
-EXP_DIR="vit-mae-orig-100ep_test"
+EXP_DIR="vit_mae_orig_2000ep_cifar10"
 
 CUDA_VISIBLE_DEVICES=0 \
 python MAE/run.py \
@@ -15,10 +15,10 @@ python MAE/run.py \
     --base_learning_rate 1.5e-4 \
     --lr_scheduler_type cosine \
     --weight_decay 0.05 \
-    --num_train_epochs 50 \
+    --num_train_epochs 2000 \
     --warmup_ratio 0.05 \
-    --per_device_train_batch_size 8 \
-    --per_device_eval_batch_size 8 \
+    --per_device_train_batch_size 512 \
+    --per_device_eval_batch_size 512 \
     --dataloader_num_workers 8 \
     --dataloader_persistent_workers True \
     --logging_strategy steps \
